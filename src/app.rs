@@ -6,11 +6,24 @@ use tokio::sync::mpsc;
 use futures::SinkExt as _;
 
 use iced::{
-    widget::{button, column, container, row, scrollable, text, text_input, Space},
-    Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme,
+    Font,
+    widget::{button, column, container, row, scrollable, text, text_editor, Space},
+    Alignment, Background, Border, Color, Element, Length, Pixels, Subscription, Task, Theme,
 };
 
-use crate::mcp_server::QuestionRequest;
+use crate::mcp_server::{QuestionRequest, ServerCommand};
+
+// ---------------------------------------------------------------------------
+// Bootstrap Icons constants  (embedded via Cargo asset in main.rs)
+// ---------------------------------------------------------------------------
+
+/// Bootstrap Icons font, referenced by name after loading the bytes.
+const ICONS_FONT: Font = Font::with_name("bootstrap-icons");
+
+/// Bootstrap Icons code-point for "check-lg" (U+F72A).
+const ICON_CHECK: char = '\u{F72A}';
+/// Bootstrap Icons code-point for "x-lg"  (U+F750).
+const ICON_X: char = '\u{F750}';
 
 // ---------------------------------------------------------------------------
 // Public flags (passed from main)
@@ -18,7 +31,8 @@ use crate::mcp_server::QuestionRequest;
 
 pub struct Flags {
     pub question_rx: Arc<Mutex<Option<mpsc::Receiver<QuestionRequest>>>>,
-    pub port: u16,
+    pub initial_port: u16,
+    pub cmd_tx: mpsc::Sender<ServerCommand>,
 }
 
 // ---------------------------------------------------------------------------
@@ -35,14 +49,33 @@ enum CardState {
     Error(String),
 }
 
-#[derive(Debug)]
 struct QuestionCard {
     id: String,
     question: String,
     context: Option<String>,
-    answer_input: String,
+    editor: text_editor::Content,
     state: CardState,
     answer_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Option<String>>>>>,
+}
+
+impl std::fmt::Debug for QuestionCard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuestionCard")
+            .field("id", &self.id)
+            .field("question", &self.question)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server state
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerState {
+    Stopped,
+    Running(u16),
 }
 
 // ---------------------------------------------------------------------------
@@ -52,7 +85,10 @@ struct QuestionCard {
 pub struct App {
     questions: Vec<QuestionCard>,
     question_rx: Arc<Mutex<Option<mpsc::Receiver<QuestionRequest>>>>,
-    port: u16,
+    /// Desired port (editable in the status bar).
+    port_input: String,
+    server_state: ServerState,
+    cmd_tx: mpsc::Sender<ServerCommand>,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,8 +100,8 @@ pub enum Message {
     /// A new question arrived from the MCP server.
     NewQuestion(QuestionRequest),
     /// User edited the answer field for a card.
-    AnswerChanged(String, String),
-    /// User clicked Submit (or pressed Enter).
+    EditorAction(String, text_editor::Action),
+    /// User hit Ctrl+Enter or clicked Submit.
     Submit(String),
     /// Result of sending the answer to the MCP server.
     Submitted(String, Result<(), String>),
@@ -73,6 +109,10 @@ pub enum Message {
     Reject(String),
     /// Remove card after the success-animation delay.
     Remove(String),
+    /// User changed the port input text.
+    PortChanged(String),
+    /// User clicked the Start / Stop server toggle.
+    ToggleServer,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,18 +121,24 @@ pub enum Message {
 
 impl App {
     pub fn new(flags: Flags) -> (Self, Task<Message>) {
+        let port_str = flags.initial_port.to_string();
         (
             App {
                 questions: Vec::new(),
                 question_rx: flags.question_rx,
-                port: flags.port,
+                port_input: port_str,
+                server_state: ServerState::Running(flags.initial_port),
+                cmd_tx: flags.cmd_tx,
             },
             Task::none(),
         )
     }
 
     pub fn title(&self) -> String {
-        format!("AskHuman  —  MCP on :{}", self.port)
+        match &self.server_state {
+            ServerState::Running(p) => format!("AskHuman  —  MCP on :{p}"),
+            ServerState::Stopped => "AskHuman  —  server stopped".into(),
+        }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -102,17 +148,21 @@ impl App {
                     id: req.id.clone(),
                     question: req.question,
                     context: req.context,
-                    answer_input: String::new(),
+                    editor: text_editor::Content::new(),
                     state: CardState::Active,
                     answer_tx: req.answer_tx,
                 });
                 Task::none()
             }
 
-            Message::AnswerChanged(id, value) => {
+            Message::EditorAction(id, action) => {
                 if let Some(card) = self.questions.iter_mut().find(|c| c.id == id) {
                     if matches!(card.state, CardState::Active | CardState::Error(_)) {
-                        card.answer_input = value;
+                        card.editor.perform(action);
+                        // Clear error on fresh input
+                        if let CardState::Error(_) = card.state {
+                            card.state = CardState::Active;
+                        }
                     }
                 }
                 Task::none()
@@ -122,7 +172,8 @@ impl App {
                 let Some(card) = self.questions.iter_mut().find(|c| c.id == id) else {
                     return Task::none();
                 };
-                let trimmed = card.answer_input.trim().to_string();
+                // Trim the trailing newline that text_editor.text() always appends.
+                let trimmed = card.editor.text().trim_end_matches('\n').trim().to_string();
                 if trimmed.is_empty() {
                     card.state =
                         CardState::Error("Please enter an answer before submitting.".into());
@@ -130,7 +181,6 @@ impl App {
                 }
 
                 let tx_arc = Arc::clone(&card.answer_tx);
-                // Clone the id so the Fn closure can reference it without moving.
                 let cid = id.clone();
                 Task::perform(
                     async move {
@@ -142,7 +192,6 @@ impl App {
                             None => Err("Already answered".into()),
                         }
                     },
-                    // The closure must be Fn; clone cid each invocation.
                     move |r| Message::Submitted(cid.clone(), r),
                 )
             }
@@ -183,6 +232,28 @@ impl App {
                 self.questions.retain(|c| c.id != id);
                 Task::none()
             }
+
+            Message::PortChanged(val) => {
+                self.port_input = val;
+                Task::none()
+            }
+
+            Message::ToggleServer => {
+                match &self.server_state {
+                    ServerState::Running(_) => {
+                        let _ = self.cmd_tx.try_send(ServerCommand::Stop);
+                        self.server_state = ServerState::Stopped;
+                    }
+                    ServerState::Stopped => {
+                        if let Ok(port) = self.port_input.trim().parse::<u16>() {
+                            let _ = self.cmd_tx.try_send(ServerCommand::Start(port));
+                            self.server_state = ServerState::Running(port);
+                        }
+                        // If the port is invalid, do nothing (the input is red/invalid).
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -190,16 +261,13 @@ impl App {
         let content: Element<Message> = if self.questions.is_empty() {
             container(
                 column![
-                    text("AskHuman").size(28),
-                    Space::with_height(12),
-                    text("Waiting for questions from AI agents…").size(15),
-                    Space::with_height(8),
-                    text(format!(
-                        "MCP endpoint:  http://127.0.0.1:{}/mcp",
-                        self.port
-                    ))
-                    .size(12)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                    text("AskHuman").size(24),
+                    Space::with_height(10),
+                    text("Waiting for questions from AI agents…").size(13),
+                    Space::with_height(6),
+                    text("Use Ctrl+Enter to submit answers.")
+                        .size(11)
+                        .color(Color::from_rgb(0.55, 0.55, 0.55)),
                 ]
                 .align_x(Alignment::Center),
             )
@@ -211,8 +279,8 @@ impl App {
         } else {
             scrollable(
                 column(self.questions.iter().map(view_card).collect::<Vec<_>>())
-                    .spacing(16)
-                    .padding(16)
+                    .spacing(14)
+                    .padding(14)
                     .width(Length::Fill),
             )
             .width(Length::Fill)
@@ -220,44 +288,109 @@ impl App {
             .into()
         };
 
-        let status = container(
-            text(format!(
-                "MCP endpoint:  http://127.0.0.1:{}/mcp",
-                self.port
-            ))
-            .size(11)
-            .color(Color::from_rgb(0.4, 0.4, 0.4)),
-        )
-        .width(Length::Fill)
-        .padding([4, 12])
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Background::Color(Color::from_rgb(0.92, 0.92, 0.92))),
-            ..Default::default()
-        });
-
+        let status = self.view_status_bar();
         column![content, status].into()
+    }
+
+    fn view_status_bar(&self) -> Element<'_, Message> {
+        let is_running = matches!(self.server_state, ServerState::Running(_));
+        let port_valid = self.port_input.trim().parse::<u16>().is_ok();
+
+        // Port text field (only editable when stopped)
+        let port_field: Element<'_, Message> = if is_running {
+            // Non-editable label when running
+            text(&self.port_input)
+                .size(11)
+                .color(Color::from_rgb(0.3, 0.3, 0.3))
+                .into()
+        } else {
+            iced::widget::text_input("port", &self.port_input)
+                .on_input(Message::PortChanged)
+                .size(11)
+                .width(Length::Fixed(60.0))
+                .padding([2, 6])
+                .style(move |theme: &Theme, status| {
+                    let mut s = iced::widget::text_input::default(theme, status);
+                    if !port_valid {
+                        s.border.color = Color::from_rgb(0.82, 0.1, 0.1);
+                    }
+                    s
+                })
+                .into()
+        };
+
+        // Endpoint URL label
+        let endpoint_label: Element<'_, Message> = if is_running {
+            if let ServerState::Running(p) = &self.server_state {
+                text(format!("http://127.0.0.1:{p}/mcp"))
+                    .size(11)
+                    .color(Color::from_rgb(0.3, 0.3, 0.3))
+                    .into()
+            } else {
+                Space::with_width(0).into()
+            }
+        } else {
+            text("(server stopped)")
+                .size(11)
+                .color(Color::from_rgb(0.55, 0.55, 0.55))
+                .into()
+        };
+
+        // Toggle button
+        let toggle_label = if is_running { "Stop" } else { "Start" };
+        let toggle_btn = {
+            let b = button(text(toggle_label).size(11))
+                .padding([2, 10])
+                .style(if is_running {
+                    button::danger
+                } else {
+                    button::primary
+                });
+            if is_running || port_valid {
+                b.on_press(Message::ToggleServer)
+            } else {
+                b
+            }
+        };
+
+        let bar_row = row![
+            text("MCP  ")
+                .size(11)
+                .color(Color::from_rgb(0.4, 0.4, 0.4)),
+            port_field,
+            Space::with_width(8),
+            endpoint_label,
+            Space::with_width(Length::Fill),
+            toggle_btn,
+        ]
+        .align_y(Alignment::Center)
+        .spacing(4);
+
+        container(bar_row)
+            .width(Length::Fill)
+            .padding([4, 12])
+            .style(|_theme: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.92, 0.92, 0.92))),
+                ..Default::default()
+            })
+            .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
         let rx_arc = Arc::clone(&self.question_rx);
 
-        // iced 0.13: use Subscription::run_with_id + iced::stream::channel.
+        // iced 0.13: Subscription::run_with_id + iced::stream::channel.
         // The stream::channel closure is FnOnce, so the receiver is taken
-        // exactly once.  run_with_id uses a stable hash derived from the
-        // id, so iced keeps this subscription alive for the whole session.
+        // exactly once.  run_with_id uses a stable hash derived from the id,
+        // so iced keeps this subscription alive for the whole session.
         Subscription::run_with_id(
             std::any::TypeId::of::<App>(),
             iced::stream::channel(128, move |mut output| async move {
-                // Take the receiver; drop the guard before any await point.
                 let rx_opt = {
                     let mut guard = rx_arc.lock().unwrap();
                     guard.take()
-                    // guard dropped here
                 };
 
-                // If the receiver is already gone (shouldn't happen given the
-                // stable subscription ID) park the stream so iced doesn't
-                // restart it in a tight loop.
                 let Some(mut rx) = rx_opt else {
                     std::future::pending::<()>().await;
                     return;
@@ -268,7 +401,6 @@ impl App {
                         Some(q) => {
                             let _ = output.send(Message::NewQuestion(q)).await;
                         }
-                        // MCP server thread exited; park to avoid restart loop.
                         None => {
                             std::future::pending::<()>().await;
                             return;
@@ -293,7 +425,13 @@ fn view_card(card: &QuestionCard) -> Element<'_, Message> {
 
     // ── Header: question text + close button ─────────────────────────────
     let close_btn = {
-        let b = button(text("✕").size(13)).style(button::text).padding([2, 6]);
+        let b = button(
+            text(ICON_X.to_string())
+                .font(ICONS_FONT)
+                .size(13),
+        )
+        .style(button::text)
+        .padding([2, 6]);
         if is_success {
             b
         } else {
@@ -302,7 +440,7 @@ fn view_card(card: &QuestionCard) -> Element<'_, Message> {
     };
 
     let header = row![
-        text(&card.question).size(15).width(Length::Fill),
+        text(&card.question).size(13).width(Length::Fill),
         close_btn,
     ]
     .align_y(Alignment::Start)
@@ -312,48 +450,78 @@ fn view_card(card: &QuestionCard) -> Element<'_, Message> {
     let body: Element<Message> = if is_success {
         column![
             header,
-            Space::with_height(8),
-            text("✓  Answer submitted successfully!")
-                .size(14)
-                .color(SUCCESS_GREEN),
+            Space::with_height(6),
+            row![
+                text(ICON_CHECK.to_string())
+                    .font(ICONS_FONT)
+                    .size(14)
+                    .color(SUCCESS_GREEN),
+                Space::with_width(6),
+                text("Answer submitted successfully!")
+                    .size(12)
+                    .color(SUCCESS_GREEN),
+            ]
+            .align_y(Alignment::Center),
         ]
         .spacing(4)
         .into()
     } else {
-        let mut col = column![header].spacing(6);
+        let mut col = column![header].spacing(5);
 
         // Optional context
         if let Some(ctx) = &card.context {
             col = col.push(
                 text(ctx)
-                    .size(12)
+                    .size(11)
                     .color(Color::from_rgb(0.45, 0.45, 0.45)),
             );
         }
 
         // Error tip (red, above the input)
         if let CardState::Error(ref msg) = card.state {
-            col = col.push(text(msg).size(12).color(Color::from_rgb(0.82, 0.1, 0.1)));
+            col = col.push(text(msg).size(11).color(Color::from_rgb(0.82, 0.1, 0.1)));
         }
 
-        // Answer text input
+        // Multi-line answer editor – grows with content, max 300 px before
+        // internal scrolling kicks in.
+        let line_count = card.editor.line_count();
+        let editor_height = ((line_count as f32 * EDITOR_LINE_HEIGHT) + EDITOR_PADDING_HEIGHT)
+            .clamp(EDITOR_MIN_HEIGHT, EDITOR_MAX_HEIGHT);
+
+        let cid = card.id.clone();
+        let cid2 = card.id.clone();
         col = col.push(
-            text_input("Type your answer here…", &card.answer_input)
-                .on_input(|v| Message::AnswerChanged(card.id.clone(), v))
-                .on_submit(Message::Submit(card.id.clone()))
-                .padding(10)
-                .width(Length::Fill),
+            text_editor(&card.editor)
+                .placeholder("Type your answer here…")
+                .height(Pixels(editor_height))
+                .on_action(move |a| Message::EditorAction(cid.clone(), a))
+                .key_binding(move |kp| {
+                    use iced::keyboard::key::Named;
+                    let is_enter = matches!(
+                        kp.key,
+                        iced::keyboard::Key::Named(Named::Enter)
+                    );
+                    if is_enter && kp.modifiers.control() {
+                        Some(text_editor::Binding::Custom(Message::Submit(cid2.clone())))
+                    } else {
+                        text_editor::Binding::from_key_press(kp)
+                    }
+                }),
         );
 
-        // Submit button (right-aligned)
+        // Submit row: hint on left, button on right
         col = col.push(
             row![
+                text("Ctrl+Enter to submit")
+                    .size(10)
+                    .color(Color::from_rgb(0.6, 0.6, 0.6)),
                 Space::with_width(Length::Fill),
-                button(text("Submit Answer"))
+                button(text("Submit Answer").size(12))
                     .on_press(Message::Submit(card.id.clone()))
                     .style(button::primary)
-                    .padding([8, 18]),
-            ],
+                    .padding([6, 16]),
+            ]
+            .align_y(Alignment::Center),
         );
 
         col.into()
@@ -370,7 +538,7 @@ fn view_card(card: &QuestionCard) -> Element<'_, Message> {
 
     container(body)
         .width(Length::Fill)
-        .padding(16)
+        .padding(14)
         .style(move |_theme: &Theme| container::Style {
             background: Some(Background::Color(Color::WHITE)),
             border: Border {
@@ -389,3 +557,12 @@ const SUCCESS_GREEN: Color = Color {
     b: 0.3,
     a: 1.0,
 };
+
+/// Approximate rendered line height in pixels for the answer text editor.
+const EDITOR_LINE_HEIGHT: f32 = 19.0;
+/// Vertical padding (top + bottom) added to the editor height.
+const EDITOR_PADDING_HEIGHT: f32 = 22.0;
+/// Minimum editor height in pixels (one line with padding).
+const EDITOR_MIN_HEIGHT: f32 = 58.0;
+/// Maximum editor height in pixels before internal scrolling takes over.
+const EDITOR_MAX_HEIGHT: f32 = 300.0;
