@@ -254,16 +254,25 @@ impl App {
                     guard.take()
                     // guard dropped here
                 };
-                let mut rx = match rx_opt {
-                    Some(r) => r,
-                    None => std::future::pending::<mpsc::Receiver<QuestionRequest>>().await,
+
+                // If the receiver is already gone (shouldn't happen given the
+                // stable subscription ID) park the stream so iced doesn't
+                // restart it in a tight loop.
+                let Some(mut rx) = rx_opt else {
+                    std::future::pending::<()>().await;
+                    return;
                 };
+
                 loop {
                     match rx.recv().await {
                         Some(q) => {
                             let _ = output.send(Message::NewQuestion(q)).await;
                         }
-                        None => std::future::pending::<()>().await,
+                        // MCP server thread exited; park to avoid restart loop.
+                        None => {
+                            std::future::pending::<()>().await;
+                            return;
+                        }
                     }
                 }
             }),
